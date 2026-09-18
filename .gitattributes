@@ -1,2 +1,7 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Published artifacts are binary and must never be normalized.
+*.jar binary
+*.zip binary
+*.asc binary

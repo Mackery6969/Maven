@@ -1,0 +1,11 @@
+/*.jar
+  Content-Type: application/java-archive
+  Cache-Control: public, max-age=31536000, immutable
+
+/*.pom
+  Content-Type: application/xml
+  Cache-Control: public, max-age=31536000, immutable
+
+/*.xml
+  Content-Type: application/xml
+  Cache-Control: public, max-age=300
