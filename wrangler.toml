@@ -1,9 +1,22 @@
 name = "maven"
 main = "src/index.ts"
-compatibility_date = "2024-09-01"
+compatibility_date = "2026-09-18"
 
 routes = [{ pattern = "maven.mackery.com", custom_domain = true }]
 
 [[r2_buckets]]
 binding = "MAVEN"
 bucket_name = "maven"
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+
+# Traffic here is a handful of requests per build, so sampling everything stays
+# cheap and keeps traces useful. Lower this if the repository gets busy.
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
