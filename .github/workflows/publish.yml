@@ -1,0 +1,128 @@
+name: publish
+
+# Reusable: uploads a staged Maven tree to the R2 bucket behind maven.mackery.com
+# and refreshes the artifact's maven-metadata.xml.
+#
+# Callers stage their tree with `./gradlew publish`, upload it with
+# actions/upload-artifact, then call this workflow with that artifact's name.
+
+on:
+  workflow_call:
+    inputs:
+      artifact:
+        description: "Name of the uploaded artifact holding the Maven tree"
+        required: true
+        type: string
+      group_path:
+        description: "Group path of the artifact, e.g. com/github/elenterius/Biomancy"
+        required: true
+        type: string
+      group_id:
+        description: "Group id, e.g. com.github.elenterius"
+        required: true
+        type: string
+      artifact_id:
+        description: "Artifact id, e.g. Biomancy"
+        required: true
+        type: string
+      version:
+        description: "Version being published, e.g. 2.9.8.2"
+        required: true
+        type: string
+      bucket:
+        description: "R2 bucket name"
+        required: false
+        default: maven
+        type: string
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    name: Upload to R2
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      BUCKET: ${{ inputs.bucket }}
+      GROUP_PATH: ${{ inputs.group_path }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - name: Download the staged Maven tree
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ inputs.artifact }}
+          path: staging
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install wrangler
+        run: npm install -g wrangler@4
+
+      - name: Upload artifacts
+        working-directory: staging
+        run: |
+          find . -type f | sed 's|^\./||' | while read -r key; do
+            echo "put $key"
+            wrangler r2 object put "$BUCKET/$key" --file "$key" --remote
+          done
+
+      - name: Refresh maven-metadata.xml
+        env:
+          GROUP_ID: ${{ inputs.group_id }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # The published endpoint is the source of truth for which versions exist;
+          # a miss just means this is the first publish of the artifact.
+          curl -fsSL "https://maven.mackery.com/$GROUP_PATH/maven-metadata.xml" \
+            -o existing.xml || : > existing.xml
+
+          python3 - <<'PY'
+          import os, re, datetime, pathlib
+
+          version = os.environ["VERSION"]
+          existing = pathlib.Path("existing.xml")
+          text = existing.read_text() if existing.stat().st_size else ""
+          versions = set(re.findall(r"<version>([^<]+)</version>", text))
+          versions.add(version)
+
+          def sort_key(v):
+              return [int(p) if p.isdigit() else p for p in re.split(r"[.\-+]", v)]
+
+          ordered = sorted(versions, key=sort_key)
+          latest = ordered[-1]
+          items = "\n".join(f"      <version>{v}</version>" for v in ordered)
+          stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+
+          pathlib.Path("maven-metadata.xml").write_text(
+              '<?xml version="1.0" encoding="UTF-8"?>\n'
+              "<metadata>\n"
+              f"  <groupId>{os.environ['GROUP_ID']}</groupId>\n"
+              f"  <artifactId>{os.environ['ARTIFACT_ID']}</artifactId>\n"
+              "  <versioning>\n"
+              f"    <latest>{latest}</latest>\n"
+              f"    <release>{latest}</release>\n"
+              "    <versions>\n"
+              f"{items}\n"
+              "    </versions>\n"
+              f"    <lastUpdated>{stamp}</lastUpdated>\n"
+              "  </versioning>\n"
+              "</metadata>\n"
+          )
+          print("published versions: " + ", ".join(ordered))
+          PY
+
+          wrangler r2 object put "$BUCKET/$GROUP_PATH/maven-metadata.xml" \
+            --file maven-metadata.xml --content-type application/xml --remote
