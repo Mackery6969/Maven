@@ -1,10 +1,10 @@
 name: publish
 
-# Reusable: uploads a staged Maven tree to the R2 bucket behind maven.mackery.com
-# and refreshes the artifact's maven-metadata.xml.
+# Reusable: uploads a staged Maven tree to the R2 bucket behind maven.mackery.com.
 #
 # Callers stage their tree with `./gradlew publish`, upload it with
-# actions/upload-artifact, then call this workflow with that artifact's name.
+# actions/upload-artifact, then call this with that artifact's name. Coordinates
+# are read from the tree itself, so there is nothing for a caller to get wrong.
 
 on:
   workflow_call:
@@ -13,26 +13,15 @@ on:
         description: "Name of the uploaded artifact holding the Maven tree"
         required: true
         type: string
-      group_path:
-        description: "Group path of the artifact, e.g. com/github/elenterius/Biomancy"
-        required: true
-        type: string
-      group_id:
-        description: "Group id, e.g. com.github.elenterius"
-        required: true
-        type: string
-      artifact_id:
-        description: "Artifact id, e.g. Biomancy"
-        required: true
-        type: string
-      version:
-        description: "Version being published, e.g. 2.9.8.2"
-        required: true
-        type: string
       bucket:
         description: "R2 bucket name"
         required: false
         default: maven
+        type: string
+      base_url:
+        description: "Public URL of the repository, used to read current metadata"
+        required: false
+        default: https://maven.mackery.com
         type: string
     secrets:
       CLOUDFLARE_API_TOKEN:
@@ -51,7 +40,7 @@ jobs:
 
     env:
       BUCKET: ${{ inputs.bucket }}
-      GROUP_PATH: ${{ inputs.group_path }}
+      BASE_URL: ${{ inputs.base_url }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
@@ -73,30 +62,45 @@ jobs:
       - name: Upload artifacts
         working-directory: staging
         run: |
-          find . -type f | sed 's|^\./||' | while read -r key; do
+          set -euo pipefail
+          # Everything except maven-metadata.xml: that file lists only the versions
+          # present in this staging tree, so uploading it as-is would drop every
+          # previously published version. It is rebuilt from the live copy below.
+          find . -type f ! -name 'maven-metadata.xml*' | sed 's|^\./||' | while read -r key; do
             echo "put $key"
             wrangler r2 object put "$BUCKET/$key" --file "$key" --remote
           done
 
       - name: Refresh maven-metadata.xml
-        env:
-          GROUP_ID: ${{ inputs.group_id }}
-          ARTIFACT_ID: ${{ inputs.artifact_id }}
-          VERSION: ${{ inputs.version }}
+        working-directory: staging
         run: |
-          # The published endpoint is the source of truth for which versions exist;
-          # a miss just means this is the first publish of the artifact.
-          curl -fsSL "https://maven.mackery.com/$GROUP_PATH/maven-metadata.xml" \
-            -o existing.xml || : > existing.xml
+          set -euo pipefail
 
-          python3 - <<'PY'
+          # One staged tree may carry several artifacts; each has its own metadata.
+          find . -name maven-metadata.xml | sed 's|^\./||' | while read -r staged; do
+            group_path=$(dirname "$staged")
+            echo "::group::$group_path"
+
+            # The live copy is the source of truth for what has been published;
+            # a miss just means this is the artifact's first publish.
+            curl -fsSL "$BASE_URL/$group_path/maven-metadata.xml" -o live.xml || : > live.xml
+
+            STAGED="$staged" LIVE=live.xml OUT=merged.xml python3 - <<'PY'
           import os, re, datetime, pathlib
 
-          version = os.environ["VERSION"]
-          existing = pathlib.Path("existing.xml")
-          text = existing.read_text() if existing.stat().st_size else ""
-          versions = set(re.findall(r"<version>([^<]+)</version>", text))
-          versions.add(version)
+          staged = pathlib.Path(os.environ["STAGED"]).read_text()
+          live_path = pathlib.Path(os.environ["LIVE"])
+          live = live_path.read_text() if live_path.stat().st_size else ""
+
+          def field(name, text):
+              m = re.search(rf"<{name}>([^<]+)</{name}>", text)
+              return m.group(1) if m else ""
+
+          group_id = field("groupId", staged)
+          artifact_id = field("artifactId", staged)
+
+          versions = set(re.findall(r"<version>([^<]+)</version>", live))
+          versions |= set(re.findall(r"<version>([^<]+)</version>", staged))
 
           def sort_key(v):
               return [int(p) if p.isdigit() else p for p in re.split(r"[.\-+]", v)]
@@ -106,11 +110,11 @@ jobs:
           items = "\n".join(f"      <version>{v}</version>" for v in ordered)
           stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
 
-          pathlib.Path("maven-metadata.xml").write_text(
+          pathlib.Path(os.environ["OUT"]).write_text(
               '<?xml version="1.0" encoding="UTF-8"?>\n'
               "<metadata>\n"
-              f"  <groupId>{os.environ['GROUP_ID']}</groupId>\n"
-              f"  <artifactId>{os.environ['ARTIFACT_ID']}</artifactId>\n"
+              f"  <groupId>{group_id}</groupId>\n"
+              f"  <artifactId>{artifact_id}</artifactId>\n"
               "  <versioning>\n"
               f"    <latest>{latest}</latest>\n"
               f"    <release>{latest}</release>\n"
@@ -121,8 +125,19 @@ jobs:
               "  </versioning>\n"
               "</metadata>\n"
           )
-          print("published versions: " + ", ".join(ordered))
+          print(f"{group_id}:{artifact_id} -> {', '.join(ordered)}")
           PY
 
-          wrangler r2 object put "$BUCKET/$GROUP_PATH/maven-metadata.xml" \
-            --file maven-metadata.xml --content-type application/xml --remote
+            wrangler r2 object put "$BUCKET/$group_path/maven-metadata.xml" \
+              --file merged.xml --content-type application/xml --remote
+
+            # Checksums must match the merged file, not the staged one.
+            for algo in md5 sha1 sha256 sha512; do
+              "${algo}sum" merged.xml | cut -d' ' -f1 > "merged.$algo"
+              wrangler r2 object put "$BUCKET/$group_path/maven-metadata.xml.$algo" \
+                --file "merged.$algo" --content-type text/plain --remote
+            done
+
+            rm -f live.xml merged.xml merged.md5 merged.sha1 merged.sha256 merged.sha512
+            echo "::endgroup::"
+          done

@@ -11,7 +11,7 @@ repositories {
         name = "Mackery"
         url = uri("https://maven.mackery.com")
         content {
-            includeGroup("com.github.elenterius")
+            includeGroupAndSubgroups("com.github.elenterius")
         }
     }
 }
@@ -20,6 +20,7 @@ repositories {
 | artifact | coordinates |
 | --- | --- |
 | Biomancy (1.21.1 NeoForge port) | `com.github.elenterius:Biomancy:<version>` |
+| Bio-Factory | `com.github.elenterius.biofactory:Bio-Factory:<version>` |
 
 Available versions are listed in each artifact's `maven-metadata.xml`, e.g.
 <https://maven.mackery.com/com/github/elenterius/Biomancy/maven-metadata.xml>.
