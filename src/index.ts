@@ -9,6 +9,8 @@
  * after changing bindings in wrangler.toml.
  */
 
+// penis
+
 const CONTENT_TYPES: Record<string, string> = {
   jar: "application/java-archive",
   zip: "application/zip",
