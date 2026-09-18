@@ -1,0 +1,9 @@
+name = "maven"
+main = "src/index.ts"
+compatibility_date = "2024-09-01"
+
+routes = [{ pattern = "maven.mackery.com", custom_domain = true }]
+
+[[r2_buckets]]
+binding = "MAVEN"
+bucket_name = "maven"

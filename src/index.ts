@@ -1,0 +1,153 @@
+/**
+ * maven.mackery.com
+ *
+ * A read-only Maven repository served from an R2 bucket. Build tools only ever
+ * GET/HEAD artifacts; publishing happens out-of-band via `wrangler r2 object put`
+ * from each project's release workflow.
+ */
+
+export interface Env {
+  MAVEN: R2Bucket;
+}
+
+const CONTENT_TYPES: Record<string, string> = {
+  jar: "application/java-archive",
+  zip: "application/zip",
+  pom: "application/xml",
+  xml: "application/xml",
+  module: "application/json",
+  json: "application/json",
+  asc: "text/plain",
+  md5: "text/plain",
+  sha1: "text/plain",
+  sha256: "text/plain",
+  sha512: "text/plain",
+  txt: "text/plain",
+};
+
+function contentTypeFor(key: string): string {
+  const ext = key.slice(key.lastIndexOf(".") + 1).toLowerCase();
+  return CONTENT_TYPES[ext] ?? "application/octet-stream";
+}
+
+/**
+ * Released artifacts never change, so they cache forever. Metadata lists the
+ * available versions and must not go stale after a publish.
+ */
+function cacheControlFor(key: string): string {
+  return key.endsWith("maven-metadata.xml")
+    ? "public, max-age=300"
+    : "public, max-age=31536000, immutable";
+}
+
+/** Map a request path to an R2 key, rejecting traversal and empty segments. */
+function keyFor(pathname: string): string | null {
+  const decoded = decodeURIComponent(pathname).replace(/^\/+/, "");
+  if (decoded === "") return null;
+  const parts = decoded.split("/");
+  if (parts.some((p) => p === "" || p === "." || p === "..")) return null;
+  return parts.join("/");
+}
+
+type ByteRange = { offset: number; length: number; end: number };
+
+function parseByteRange(header: string | null, size: number): ByteRange | "invalid" | null {
+  if (!header) return null;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!m) return "invalid";
+
+  const [, rawStart, rawEnd] = m;
+  if (rawStart === "" && rawEnd === "") return "invalid";
+
+  let offset: number;
+  let end: number;
+
+  if (rawStart === "") {
+    // Suffix range: the last N bytes.
+    const suffix = Number(rawEnd);
+    if (!Number.isFinite(suffix) || suffix <= 0) return "invalid";
+    offset = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    offset = Number(rawStart);
+    end = rawEnd === "" ? size - 1 : Number(rawEnd);
+    if (!Number.isFinite(offset) || !Number.isFinite(end)) return "invalid";
+    if (offset > end || offset >= size) return "invalid";
+    end = Math.min(end, size - 1);
+  }
+
+  return { offset, length: end - offset + 1, end };
+}
+
+const INDEX = `maven.mackery.com
+
+A Maven repository. Point your build tool at this host:
+
+    maven { url = uri("https://maven.mackery.com") }
+
+Browse the source and publishing setup at
+https://github.com/Mackery6969/Maven
+`;
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      return new Response("Method Not Allowed", {
+        status: 405,
+        headers: { allow: "GET, HEAD", "content-type": "text/plain" },
+      });
+    }
+
+    const url = new URL(req.url);
+
+    if (url.pathname === "/" || url.pathname === "") {
+      return new Response(req.method === "HEAD" ? null : INDEX, {
+        headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "public, max-age=300" },
+      });
+    }
+
+    const key = keyFor(url.pathname);
+    if (key === null) return new Response("Not Found", { status: 404, headers: { "content-type": "text/plain" } });
+
+    const head = await env.MAVEN.head(key);
+    if (!head) return new Response("Not Found", { status: 404, headers: { "content-type": "text/plain" } });
+
+    const headers = new Headers({
+      "content-type": contentTypeFor(key),
+      "cache-control": cacheControlFor(key),
+      "accept-ranges": "bytes",
+      etag: head.httpEtag,
+    });
+
+    // Let conditional requests short-circuit; Gradle revalidates metadata often.
+    if (req.headers.get("if-none-match") === head.httpEtag) {
+      return new Response(null, { status: 304, headers });
+    }
+
+    if (req.method === "HEAD") {
+      headers.set("content-length", String(head.size));
+      return new Response(null, { headers });
+    }
+
+    const range = parseByteRange(req.headers.get("range"), head.size);
+    if (range === "invalid") {
+      headers.set("content-range", `bytes */${head.size}`);
+      return new Response("Range Not Satisfiable", { status: 416, headers });
+    }
+
+    const obj = await env.MAVEN.get(
+      key,
+      range ? { range: { offset: range.offset, length: range.length } } : undefined,
+    );
+    if (!obj) return new Response("Not Found", { status: 404, headers: { "content-type": "text/plain" } });
+
+    if (range) {
+      headers.set("content-length", String(range.length));
+      headers.set("content-range", `bytes ${range.offset}-${range.end}/${head.size}`);
+      return new Response(obj.body, { status: 206, headers });
+    }
+
+    headers.set("content-length", String(head.size));
+    return new Response(obj.body, { headers });
+  },
+} satisfies ExportedHandler<Env>;
