@@ -15,6 +15,37 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
+      # Temporary diagnostic: prints the token's actual scopes and the Workers
+      # it can see, so a permissions failure names itself instead of surfacing
+      # as "No access to the specified service". Remove once deploys are green.
+      - name: Inspect token
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT: ba11191493de1b09ea762231f608b26c
+        run: |
+          echo "::group::wrangler whoami"
+          npx -y wrangler@4 whoami || true
+          echo "::endgroup::"
+
+          echo "::group::token verify"
+          curl -s https://api.cloudflare.com/client/v4/user/tokens/verify \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | head -c 2000
+          echo
+          echo "::endgroup::"
+
+          echo "::group::can it list workers?"
+          curl -s "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/workers/scripts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);print('success:',d.get('success'));print('errors:',d.get('errors'));print('scripts:',[s.get('id') for s in (d.get('result') or [])])"
+          echo "::endgroup::"
+
+          echo "::group::can it see the r2 bucket?"
+          curl -s "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT/r2/buckets" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            | python3 -c "import sys,json;d=json.load(sys.stdin);print('success:',d.get('success'));print('errors:',d.get('errors'));print('buckets:',[b.get('name') for b in ((d.get('result') or {}).get('buckets') or [])])"
+          echo "::endgroup::"
+
       - uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
