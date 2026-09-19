@@ -1,0 +1,167 @@
+name: seed
+
+# One-off: publishes mod releases that predate the Maven setup, so the bucket
+# isn't missing versions that already shipped on GitHub. Newer releases arrive
+# through each project's own Maven workflow.
+#
+# Run from the Actions tab: Seed -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "GitHub repo holding the releases"
+        required: true
+        default: Mackery6969/Biomancy
+        type: string
+      versions:
+        description: "Space-separated versions to publish"
+        required: true
+        default: 2.9.8.1 2.9.8.2
+        type: string
+      group_id:
+        description: "Maven group id"
+        required: true
+        default: com.github.elenterius
+        type: string
+      artifact_id:
+        description: "Maven artifact id"
+        required: true
+        default: Biomancy
+        type: string
+      asset_pattern:
+        description: "Release asset glob; {v} is replaced with the version"
+        required: true
+        default: biomancy-neoforge-*-{v}.jar
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  seed:
+    name: Seed released versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      BUCKET: maven
+      GH_TOKEN: ${{ github.token }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install wrangler
+        run: npm install -g wrangler@4
+
+      - name: Build the Maven tree from GitHub releases
+        env:
+          REPO: ${{ inputs.repo }}
+          VERSIONS: ${{ inputs.versions }}
+          GROUP_ID: ${{ inputs.group_id }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+          ASSET_PATTERN: ${{ inputs.asset_pattern }}
+        run: |
+          set -euo pipefail
+          GROUP_PATH="$(echo "$GROUP_ID" | tr . /)/$ARTIFACT_ID"
+          echo "GROUP_PATH=$GROUP_PATH" >> "$GITHUB_ENV"
+
+          for V in $VERSIONS; do
+            D="staging/$GROUP_PATH/$V"
+            mkdir -p "$D"
+            gh release download "v$V" --repo "$REPO" \
+              --pattern "${ASSET_PATTERN/\{v\}/$V}" \
+              --output "$D/$ARTIFACT_ID-$V.jar"
+            cat > "$D/$ARTIFACT_ID-$V.pom" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>$GROUP_ID</groupId>
+            <artifactId>$ARTIFACT_ID</artifactId>
+            <version>$V</version>
+            <packaging>jar</packaging>
+          </project>
+          EOF
+            # Checksums, so clients that verify them don't fail on a miss.
+            for algo in md5 sha1 sha256 sha512; do
+              (cd "$D" && "${algo}sum" "$ARTIFACT_ID-$V.jar" | cut -d' ' -f1 > "$ARTIFACT_ID-$V.jar.$algo")
+              (cd "$D" && "${algo}sum" "$ARTIFACT_ID-$V.pom" | cut -d' ' -f1 > "$ARTIFACT_ID-$V.pom.$algo")
+            done
+          done
+          find staging -type f | sort
+
+      - name: Upload to R2
+        working-directory: staging
+        run: |
+          set -euo pipefail
+          find . -type f | sed 's|^\./||' | while read -r key; do
+            echo "put $key"
+            wrangler r2 object put "$BUCKET/$key" --file "$key" --remote
+          done
+
+      - name: Write maven-metadata.xml
+        env:
+          VERSIONS: ${{ inputs.versions }}
+          GROUP_ID: ${{ inputs.group_id }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+        run: |
+          set -euo pipefail
+          # Merge with whatever is already published, so seeding one artifact
+          # never drops versions from another run.
+          curl -fsSL "https://maven.mackery.com/$GROUP_PATH/maven-metadata.xml" -o live.xml || : > live.xml
+
+          python3 - <<'PY'
+          import os, re, datetime, pathlib
+
+          live_path = pathlib.Path("live.xml")
+          live = live_path.read_text() if live_path.stat().st_size else ""
+          versions = set(re.findall(r"<version>([^<]+)</version>", live))
+          versions |= set(os.environ["VERSIONS"].split())
+
+          def sort_key(v):
+              return [int(p) if p.isdigit() else p for p in re.split(r"[.\-+]", v)]
+
+          ordered = sorted(versions, key=sort_key)
+          items = "\n".join(f"      <version>{v}</version>" for v in ordered)
+          stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+
+          pathlib.Path("maven-metadata.xml").write_text(
+              '<?xml version="1.0" encoding="UTF-8"?>\n'
+              "<metadata>\n"
+              f"  <groupId>{os.environ['GROUP_ID']}</groupId>\n"
+              f"  <artifactId>{os.environ['ARTIFACT_ID']}</artifactId>\n"
+              "  <versioning>\n"
+              f"    <latest>{ordered[-1]}</latest>\n"
+              f"    <release>{ordered[-1]}</release>\n"
+              "    <versions>\n"
+              f"{items}\n"
+              "    </versions>\n"
+              f"    <lastUpdated>{stamp}</lastUpdated>\n"
+              "  </versioning>\n"
+              "</metadata>\n"
+          )
+          print("published versions: " + ", ".join(ordered))
+          PY
+
+          wrangler r2 object put "$BUCKET/$GROUP_PATH/maven-metadata.xml" \
+            --file maven-metadata.xml --content-type application/xml --remote
+          for algo in md5 sha1 sha256 sha512; do
+            "${algo}sum" maven-metadata.xml | cut -d' ' -f1 > "m.$algo"
+            wrangler r2 object put "$BUCKET/$GROUP_PATH/maven-metadata.xml.$algo" \
+              --file "m.$algo" --content-type text/plain --remote
+          done
+
+      - name: Verify
+        run: |
+          set -euo pipefail
+          for V in ${{ inputs.versions }}; do
+            URL="https://maven.mackery.com/$GROUP_PATH/$V/${{ inputs.artifact_id }}-$V.jar"
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+            echo "$CODE  $URL"
+            [ "$CODE" = "200" ] || exit 1
+          done
