@@ -43,7 +43,12 @@ function cacheControlFor(key: string): string {
 
 /** Map a request path to an R2 key, rejecting traversal and empty segments. */
 function keyFor(pathname: string): string | null {
-  const decoded = decodeURIComponent(pathname).replace(/^\/+/, "");
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname).replace(/^\/+/, "");
+  } catch {
+    return null;
+  }
   if (decoded === "") return null;
   const parts = decoded.split("/");
   if (parts.some((p) => p === "" || p === "." || p === "..")) return null;
@@ -66,7 +71,7 @@ function parseByteRange(header: string | null, size: number): ByteRange | "inval
   if (rawStart === "") {
     // Suffix range: the last N bytes.
     const suffix = Number(rawEnd);
-    if (!Number.isFinite(suffix) || suffix <= 0) return "invalid";
+    if (!Number.isFinite(suffix) || suffix <= 0 || size === 0) return "invalid";
     offset = Math.max(0, size - suffix);
     end = size - 1;
   } else {
