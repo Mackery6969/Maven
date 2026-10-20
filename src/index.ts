@@ -9,8 +9,6 @@
  * after changing bindings in wrangler.toml.
  */
 
-// penis
-
 const CONTENT_TYPES: Record<string, string> = {
   jar: "application/java-archive",
   zip: "application/zip",
@@ -95,6 +93,10 @@ Browse the source and publishing setup at
 https://github.com/Mackery6969/Maven
 `;
 
+function notFound(): Response {
+  return new Response("Not Found", { status: 404, headers: { "content-type": "text/plain" } });
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     if (req.method !== "GET" && req.method !== "HEAD") {
@@ -113,10 +115,10 @@ export default {
     }
 
     const key = keyFor(url.pathname);
-    if (key === null) return new Response("Not Found", { status: 404, headers: { "content-type": "text/plain" } });
+    if (key === null) return notFound();
 
     const head = await env.MAVEN.head(key);
-    if (!head) return new Response("Not Found", { status: 404, headers: { "content-type": "text/plain" } });
+    if (!head) return notFound();
 
     const headers = new Headers({
       "content-type": contentTypeFor(key),
@@ -145,7 +147,7 @@ export default {
       key,
       range ? { range: { offset: range.offset, length: range.length } } : undefined,
     );
-    if (!obj) return new Response("Not Found", { status: 404, headers: { "content-type": "text/plain" } });
+    if (!obj) return notFound();
 
     if (range) {
       headers.set("content-length", String(range.length));
