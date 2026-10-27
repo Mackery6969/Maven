@@ -34,7 +34,9 @@ function contentTypeFor(key: string): string {
  * available versions and must not go stale after a publish.
  */
 function cacheControlFor(key: string): string {
-  return key.endsWith("maven-metadata.xml")
+  // Includes the metadata's checksum/signature siblings (.sha1, .md5, .asc, ...),
+  // which are rewritten alongside it on every publish.
+  return key.slice(key.lastIndexOf("/") + 1).startsWith("maven-metadata.xml")
     ? "public, max-age=300"
     : "public, max-age=31536000, immutable";
 }
@@ -155,7 +157,10 @@ export default {
       return new Response(obj.body, { status: 206, headers });
     }
 
-    headers.set("content-length", String(head.size));
+    // The object may have been replaced since the head() call (metadata is
+    // rewritten on publish), so describe the body we actually got.
+    headers.set("etag", obj.httpEtag);
+    headers.set("content-length", String(obj.size));
     return new Response(obj.body, { headers });
   },
 } satisfies ExportedHandler<Env>;
